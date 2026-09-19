@@ -1,0 +1,6 @@
+{
+  "name": "Map of Chaos",
+  "description": "A private, single-user Progressive Web App prototype for Yudhan to see the chaos that already exists in his world.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
