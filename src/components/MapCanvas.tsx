@@ -1,5 +1,6 @@
 import React, { useRef, useEffect, useState, useMemo, useCallback } from 'react';
 import * as d3Force from 'd3-force';
+import { useGesture } from '@use-gesture/react';
 import { Thing, Relationship } from '../types';
 import { ROOT_NODE_ID } from '../data/initialData';
 import { Plus, Minus, RotateCcw, Target, Sparkles, AlertCircle } from 'lucide-react';
@@ -187,66 +188,182 @@ export const MapCanvas: React.FC<MapCanvasProps> = ({
     };
   }, [activeThings.length, activeRelationships.length, degreeMap]);
 
-  // Pan handlers
-  const handleMouseDown = (e: React.MouseEvent) => {
-    // Only pan if clicking on the background svg or background element
-    if ((e.target as HTMLElement).tagName === 'svg' || (e.target as HTMLElement).id === 'map-background') {
-      setIsPanning(true);
-      panStartRef.current = { x: e.clientX - transform.x, y: e.clientY - transform.y };
-    }
-  };
+  // Stable refs for gesture callbacks
+  const nodesRef = useRef<GraphNode[]>(nodes);
+  nodesRef.current = nodes;
+  const onSelectThingRef = useRef(onSelectThing);
+  onSelectThingRef.current = onSelectThing;
+  const onUpdateThingPositionRef = useRef(onUpdateThingPosition);
+  onUpdateThingPositionRef.current = onUpdateThingPosition;
+  const selectedThingIdRef = useRef(selectedThingId);
+  selectedThingIdRef.current = selectedThingId;
 
-  const handleMouseMove = (e: React.MouseEvent) => {
-    if (isPanning) {
-      setTransform((prev) => ({
-        ...prev,
-        x: e.clientX - panStartRef.current.x,
-        y: e.clientY - panStartRef.current.y,
-      }));
-    } else if (draggedNodeRef.current && simulationRef.current) {
-      // Dragging a node in world coordinates
-      const worldX = (e.clientX - transform.x) / transform.k;
-      const worldY = (e.clientY - transform.y) / transform.k;
-
-      const node = draggedNodeRef.current;
-      node.fx = worldX;
-      node.fy = worldY;
-      simulationRef.current.alpha(0.2).restart();
-    }
-  };
-
-  const handleMouseUp = () => {
-    setIsPanning(false);
-    if (draggedNodeRef.current) {
-      const n = draggedNodeRef.current;
-      if (!n.thing.isRoot) {
-        n.fx = null;
-        n.fy = null;
-        if (onUpdateThingPosition && n.x !== undefined && n.y !== undefined) {
-          onUpdateThingPosition(n.id, Math.round(n.x), Math.round(n.y));
+  // React-use-gesture: unified pinch-to-zoom, two-finger panning, single-finger panning, and node dragging
+  useGesture(
+    {
+      onDrag: ({ first, active, last, delta, memo, tap, event, xy }) => {
+        const evt = event as any;
+        // If 2 or more touches are active, yield to onPinch for fluid 2-finger zoom/pan
+        if (
+          (evt?.touches && evt.touches.length > 1) ||
+          (evt?.pointerType === 'touch' && evt?.isPrimary === false)
+        ) {
+          return memo;
         }
-      }
-      draggedNodeRef.current = null;
+
+        const target = event.target as Element | null;
+        const nodeElement = target?.closest('[data-node-id]') as SVGElement | null;
+        const nodeId = nodeElement?.getAttribute('data-node-id');
+
+        if (first) {
+          if (nodeId) {
+            const node = nodesRef.current.find((n) => n.id === nodeId);
+            if (node) {
+              draggedNodeRef.current = node;
+              const rect = containerRef.current?.getBoundingClientRect();
+              const pointerX = xy[0] - (rect?.left || 0);
+              const pointerY = xy[1] - (rect?.top || 0);
+              const worldX = (pointerX - transformRef.current.x) / transformRef.current.k;
+              const worldY = (pointerY - transformRef.current.y) / transformRef.current.k;
+              node.fx = worldX;
+              node.fy = worldY;
+              simulationRef.current?.alphaTarget(0.2).restart();
+              return { mode: 'node', node, hasMoved: false };
+            }
+          }
+          setIsPanning(true);
+          return { mode: 'pan', hasMoved: false };
+        }
+
+        if (active && memo) {
+          if (memo.mode === 'node' && memo.node) {
+            const n = memo.node;
+            const rect = containerRef.current?.getBoundingClientRect();
+            const pointerX = xy[0] - (rect?.left || 0);
+            const pointerY = xy[1] - (rect?.top || 0);
+            const worldX = (pointerX - transformRef.current.x) / transformRef.current.k;
+            const worldY = (pointerY - transformRef.current.y) / transformRef.current.k;
+            n.fx = worldX;
+            n.fy = worldY;
+            simulationRef.current?.alpha(0.2).restart();
+            memo.hasMoved = true;
+            return memo;
+          }
+
+          if (memo.mode === 'pan') {
+            setTransform((prev) => ({
+              ...prev,
+              x: prev.x + delta[0],
+              y: prev.y + delta[1],
+            }));
+            memo.hasMoved = true;
+            return memo;
+          }
+        }
+
+        if (last && memo) {
+          if (memo.mode === 'node' && memo.node) {
+            const n = memo.node;
+            if (!n.thing.isRoot) {
+              n.fx = null;
+              n.fy = null;
+              if (
+                memo.hasMoved &&
+                onUpdateThingPositionRef.current &&
+                n.x !== undefined &&
+                n.y !== undefined
+              ) {
+                onUpdateThingPositionRef.current(n.id, Math.round(n.x), Math.round(n.y));
+              }
+            }
+            simulationRef.current?.alphaTarget(0);
+            draggedNodeRef.current = null;
+          } else if (memo.mode === 'pan') {
+            setIsPanning(false);
+            if (tap || !memo.hasMoved) {
+              // Tapped on canvas background -> deselect
+              onSelectThingRef.current(null);
+            }
+          }
+        }
+
+        return memo;
+      },
+
+      onPinch: ({ first, active, offset: [scale], origin: [ox, oy], da: [dist], memo, event }) => {
+        if (event.cancelable) {
+          event.preventDefault();
+        }
+
+        const rect = containerRef.current?.getBoundingClientRect();
+        if (!rect) return memo;
+
+        const currentOriginX = ox - rect.left;
+        const currentOriginY = oy - rect.top;
+
+        if (first) {
+          const worldCenterX = (currentOriginX - transformRef.current.x) / transformRef.current.k;
+          const worldCenterY = (currentOriginY - transformRef.current.y) / transformRef.current.k;
+          return {
+            worldCenterX,
+            worldCenterY,
+            startK: transformRef.current.k,
+            startScale: scale,
+            startDist: dist || 1,
+          };
+        }
+
+        if (!memo) return memo;
+
+        // Optical zoom calculation supporting both mobile multi-touch pinch and trackpad pinch
+        const scaleRatio =
+          dist > 0 && memo.startDist > 0 ? dist / memo.startDist : scale / (memo.startScale || 1);
+        const newK = Math.max(0.2, Math.min(3.5, memo.startK * scaleRatio));
+
+        // Center zoom & two-finger pan simultaneously around touch midpoint
+        const newX = currentOriginX - memo.worldCenterX * newK;
+        const newY = currentOriginY - memo.worldCenterY * newK;
+
+        setTransform({
+          k: newK,
+          x: newX,
+          y: newY,
+        });
+
+        return memo;
+      },
+
+      onWheel: ({ event, delta: [, dy] }) => {
+        if (event.ctrlKey) return; // Allow pinch handler to manage ctrlKey trackpad pinch
+        if (event.cancelable) event.preventDefault();
+
+        const zoomFactor = dy < 0 ? 1.08 : 0.92;
+        const newK = Math.max(0.2, Math.min(3.5, transformRef.current.k * zoomFactor));
+
+        const rect = containerRef.current?.getBoundingClientRect();
+        if (!rect) return;
+        const mouseX = (event as WheelEvent).clientX - rect.left;
+        const mouseY = (event as WheelEvent).clientY - rect.top;
+
+        const currentK = transformRef.current.k;
+        const newX = mouseX - (mouseX - transformRef.current.x) * (newK / currentK);
+        const newY = mouseY - (mouseY - transformRef.current.y) * (newK / currentK);
+
+        setTransform({ x: newX, y: newY, k: newK });
+      },
+    },
+    {
+      target: containerRef,
+      eventOptions: { passive: false },
+      drag: {
+        filterTaps: true,
+        preventScroll: true,
+      },
+      pinch: {
+        scaleBounds: { min: 0.2, max: 3.5 },
+      },
     }
-  };
-
-  // Zoom handlers
-  const handleWheel = (e: React.WheelEvent) => {
-    e.preventDefault();
-    const zoomFactor = e.deltaY < 0 ? 1.08 : 0.92;
-    const newK = Math.max(0.2, Math.min(3.5, transform.k * zoomFactor));
-
-    // Zoom centered at cursor position
-    const rect = containerRef.current?.getBoundingClientRect();
-    if (!rect) return;
-    const mouseX = e.clientX - rect.left;
-    const mouseY = e.clientY - rect.top;
-
-    const newX = mouseX - (mouseX - transform.x) * (newK / transform.k);
-    const newY = mouseY - (mouseY - transform.y) * (newK / transform.k);
-
-    setTransform({ x: newX, y: newY, k: newK });
-  };
+  );
 
   const zoomIn = () => {
     setTransform((prev) => {
@@ -280,19 +397,6 @@ export const MapCanvas: React.FC<MapCanvasProps> = ({
       y: dimensions.height / 2,
       k: 1,
     });
-  };
-
-  // Node Drag start
-  const handleNodeMouseDown = (e: React.MouseEvent, node: GraphNode) => {
-    e.stopPropagation();
-    draggedNodeRef.current = node;
-    const worldX = (e.clientX - transform.x) / transform.k;
-    const worldY = (e.clientY - transform.y) / transform.k;
-    node.fx = worldX;
-    node.fy = worldY;
-    if (simulationRef.current) {
-      simulationRef.current.alphaTarget(0.2).restart();
-    }
   };
 
   // Helper to color nodes based on types or uncertainty
@@ -336,11 +440,8 @@ export const MapCanvas: React.FC<MapCanvasProps> = ({
     <div
       ref={containerRef}
       id="map-canvas-container"
-      className="relative w-full h-full select-none overflow-hidden bg-[#0c0e12] cursor-grab active:cursor-grabbing"
-      onMouseDown={handleMouseDown}
-      onMouseMove={handleMouseMove}
-      onMouseUp={handleMouseUp}
-      onWheel={handleWheel}
+      className="relative w-full h-full select-none overflow-hidden bg-[#0c0e12] cursor-grab active:cursor-grabbing touch-none"
+      style={{ touchAction: 'none' }}
     >
       {/* Background cartographic grid */}
       <svg
@@ -457,10 +558,10 @@ export const MapCanvas: React.FC<MapCanvasProps> = ({
               return (
                 <g
                   key={node.id}
+                  data-node-id={node.id}
                   transform={`translate(${node.x}, ${node.y})`}
                   className="cursor-pointer transition-opacity duration-200"
                   opacity={isDimmed ? 0.25 : 1}
-                  onMouseDown={(e) => handleNodeMouseDown(e, node)}
                   onClick={(e) => {
                     e.stopPropagation();
                     onSelectThing(node.id === selectedThingId ? null : node.id);
@@ -570,31 +671,31 @@ export const MapCanvas: React.FC<MapCanvasProps> = ({
         </g>
       </svg>
 
-      {/* Map Control HUD (Minimalist, calm, unobtrusive) */}
-      <div className="absolute bottom-6 right-6 flex flex-col gap-1.5 z-20">
+      {/* Map Control HUD (Minimalist, calm, unobtrusive, mobile-optimized) */}
+      <div className="absolute bottom-28 sm:bottom-6 right-4 sm:right-6 flex flex-col gap-2 sm:gap-1.5 z-20">
         <button
           id="map-zoom-in-btn"
           onClick={zoomIn}
-          className="w-8 h-8 rounded-md bg-[#12161f]/80 hover:bg-[#1e2433] border border-slate-800 text-slate-300 flex items-center justify-center transition shadow-lg cursor-pointer"
+          className="w-10 h-10 sm:w-8 sm:h-8 rounded-lg sm:rounded-md bg-[#12161f]/90 hover:bg-[#1e2433] active:scale-95 border border-slate-700 sm:border-slate-800 text-slate-200 sm:text-slate-300 flex items-center justify-center transition shadow-lg cursor-pointer touch-manipulation"
           title="Zoom In"
         >
-          <Plus className="w-4 h-4" />
+          <Plus className="w-5 h-5 sm:w-4 sm:h-4" />
         </button>
         <button
           id="map-zoom-out-btn"
           onClick={zoomOut}
-          className="w-8 h-8 rounded-md bg-[#12161f]/80 hover:bg-[#1e2433] border border-slate-800 text-slate-300 flex items-center justify-center transition shadow-lg cursor-pointer"
+          className="w-10 h-10 sm:w-8 sm:h-8 rounded-lg sm:rounded-md bg-[#12161f]/90 hover:bg-[#1e2433] active:scale-95 border border-slate-700 sm:border-slate-800 text-slate-200 sm:text-slate-300 flex items-center justify-center transition shadow-lg cursor-pointer touch-manipulation"
           title="Zoom Out"
         >
-          <Minus className="w-4 h-4" />
+          <Minus className="w-5 h-5 sm:w-4 sm:h-4" />
         </button>
         <button
           id="map-center-yudhan-btn"
           onClick={centerOnYudhan}
-          className="w-8 h-8 rounded-md bg-[#12161f]/80 hover:bg-[#1e2433] border border-slate-800 text-slate-300 flex items-center justify-center transition shadow-lg cursor-pointer"
+          className="w-10 h-10 sm:w-8 sm:h-8 rounded-lg sm:rounded-md bg-[#12161f]/90 hover:bg-[#1e2433] active:scale-95 border border-slate-700 sm:border-slate-800 text-slate-200 sm:text-slate-300 flex items-center justify-center transition shadow-lg cursor-pointer touch-manipulation"
           title="Center on Yudhan (Origin Anchor)"
         >
-          <Target className="w-4 h-4" />
+          <Target className="w-5 h-5 sm:w-4 sm:h-4" />
         </button>
       </div>
 

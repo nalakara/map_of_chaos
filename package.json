@@ -13,6 +13,7 @@
   "dependencies": {
     "@google/genai": "^2.4.0",
     "@tailwindcss/vite": "^4.3.3",
+    "@use-gesture/react": "^10.3.1",
     "@vitejs/plugin-react": "^6.1.1",
     "d3-force": "^3.0.0",
     "dotenv": "^17.2.3",
