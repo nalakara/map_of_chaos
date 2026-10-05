@@ -15,7 +15,15 @@ import { InboxView } from './components/InboxView';
 import { WanderView } from './components/WanderView';
 import { ErasedView } from './components/ErasedView';
 import { OfflineIndicator } from './components/OfflineIndicator';
-import { analyzeDumpLocally, reflectOnWander } from './services/aiService';
+import { reflectOnWander } from './services/aiService';
+import { getDefaultContextStore } from './storage/contextStore';
+import { SemanticExtractionOrchestrator } from './pipeline/extraction/extractor';
+import { DeterministicSemanticExtractor } from './pipeline/extraction/deterministic';
+import { DeterministicEntityResolver } from './pipeline/resolution/resolver';
+import { ContextAccumulator } from './pipeline/resolution/accumulator';
+import { ContextProjector } from './projection/projector';
+import { projectToMapElements } from './projection/adapter';
+import { Dump as DomainDump } from './domain/types';
 
 const STORAGE_KEYS = {
   THINGS: 'map_of_chaos_things_v1',
@@ -109,93 +117,85 @@ export default function App() {
 
   const erasedCount = things.filter((t) => t.status === 'erased').length;
 
-  // PRIMARY ACTION: DUMP
-  // Write -> Save immediately. No categorization required.
-  const handleDump = (rawText: string) => {
-    setIsAnalyzing(true);
-
-    const dumpId = `dump-${Date.now()}`;
-    const analysis = analyzeDumpLocally(rawText, things);
-
-    const newThings: Thing[] = [];
-    const newRelationships: Relationship[] = [];
-
-    analysis.suggestedThings.forEach((suggested, index) => {
-      const thingId = `thing-${Date.now()}-${index}`;
-
-      // Calculate organic offset from center
-      const angle = Math.random() * Math.PI * 2;
-      const distance = 140 + Math.random() * 160;
-      const x = Math.cos(angle) * distance;
-      const y = Math.sin(angle) * distance;
-
-      const createdThing: Thing = {
-        id: thingId,
-        title: suggested.title,
-        description: suggested.description,
-        originalDumpId: dumpId,
-        originalDumpText: rawText, // Preserved forever
-        types: suggested.types,
-        uncertaintyState: suggested.uncertaintyState,
-        status: 'active',
-        createdAt: new Date().toISOString(),
-        updatedAt: new Date().toISOString(),
-        aiInterpretation: {
-          summary: suggested.summary,
-          detectedTypes: suggested.types,
-          contextQuestion: suggested.contextQuestion,
-          suggestedRelationships: suggested.suggestedRelationships,
-        },
-        context: {
-          isUnknown: suggested.uncertaintyState === 'unknown',
-          whatIsThis: suggested.uncertaintyState === 'unknown' ? '' : suggested.title,
-          possibleType: suggested.types[0],
-          notes: '',
-        },
-        x,
-        y,
-      };
-
-      newThings.push(createdThing);
-
-      // If suggested relationships were generated
-      if (suggested.suggestedRelationships) {
-        suggested.suggestedRelationships.forEach((rel) => {
-          newRelationships.push({
-            id: `rel-ai-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
-            source: thingId,
-            target: rel.targetThingId,
-            label: rel.reason,
-            type: 'ai_suggested',
-            certainty: rel.certainty,
-            createdAt: new Date().toISOString(),
-          });
-        });
+  // Load semantic context from ContextStore on mount
+  useEffect(() => {
+    let isMounted = true;
+    (async () => {
+      try {
+        const store = await getDefaultContextStore();
+        const existingEntities = await store.getAllEntities();
+        if (existingEntities.length > 0 && isMounted) {
+          const projector = new ContextProjector();
+          const projection = await projector.project(store);
+          const elements = projectToMapElements(projection);
+          setThings(elements.things);
+          setRelationships(elements.relationships);
+        }
+      } catch (err) {
+        console.error('Failed to load semantic context from storage:', err);
       }
-    });
-
-    // Create persistent dump log
-    const newDump: Dump = {
-      id: dumpId,
-      rawText,
-      timestamp: new Date().toISOString(),
-      extractedThingIds: newThings.map((t) => t.id),
+    })();
+    return () => {
+      isMounted = false;
     };
+  }, []);
 
-    setDumps((prev) => [newDump, ...prev]);
-    setThings((prev) => [...prev, ...newThings]);
-    setRelationships((prev) => [...prev, ...newRelationships]);
+  // PRIMARY ACTION: DUMP
+  // Ingests raw text into Semantic Pipeline -> Resolution -> ContextStore -> Projection -> Map
+  const handleDump = async (rawText: string) => {
+    setIsAnalyzing(true);
+    try {
+      const dumpId = `dump-${Date.now()}`;
+      const store = await getDefaultContextStore();
 
-    setIsAnalyzing(false);
+      const domainDump: DomainDump = {
+        id: dumpId,
+        rawText,
+        source: 'web_dock',
+        createdAt: new Date().toISOString(),
+        processingStatus: 'captured',
+      };
+      await store.dumps.saveDump(domainDump);
 
-    // If on another view, return to Map so Yudhan can see where it appeared
-    if (currentView !== 'map') {
-      setCurrentView('map');
-    }
+      const orchestrator = new SemanticExtractionOrchestrator(new DeterministicSemanticExtractor());
+      const resolver = new DeterministicEntityResolver();
+      const accumulator = new ContextAccumulator(store, resolver);
 
-    // Automatically focus on the primary newly created thing
-    if (newThings.length > 0) {
-      setSelectedThingId(newThings[0].id);
+      const grounded = await orchestrator.extractAndGround(domainDump, store.dumps, store.entities);
+      const accumulated = await accumulator.accumulate(grounded);
+
+      // Build existing coordinates map so dragged nodes maintain their positions
+      const coordMap = new Map<string, { x?: number; y?: number }>();
+      things.forEach((t) => coordMap.set(t.id, { x: t.x, y: t.y }));
+
+      // Project context
+      const projector = new ContextProjector();
+      const projection = await projector.project(store);
+      const elements = projectToMapElements(projection, coordMap);
+
+      setThings(elements.things);
+      setRelationships(elements.relationships);
+
+      // Create persistent dump log for UI
+      const newDump: Dump = {
+        id: dumpId,
+        rawText,
+        timestamp: new Date().toISOString(),
+        extractedThingIds: accumulated.createdEntities.map((e) => e.id),
+      };
+      setDumps((prev) => [newDump, ...prev]);
+
+      if (currentView !== 'map') {
+        setCurrentView('map');
+      }
+
+      if (accumulated.createdEntities.length > 0) {
+        setSelectedThingId(accumulated.createdEntities[0].id);
+      }
+    } catch (err) {
+      console.error('Semantic pipeline processing error:', err);
+    } finally {
+      setIsAnalyzing(false);
     }
   };
 
@@ -282,12 +282,18 @@ export default function App() {
   };
 
   // Reset to prototype sample state
-  const handleResetToDemo = () => {
+  const handleResetToDemo = async () => {
     if (
       window.confirm(
         'Reset Map of Chaos to initial prototype sample data? (Coffee Calculator, Borga, Yudhan origin, etc.)'
       )
     ) {
+      try {
+        const store = await getDefaultContextStore();
+        await store.clear();
+      } catch (err) {
+        console.warn('Could not clear ContextStore:', err);
+      }
       setThings(INITIAL_THINGS);
       setRelationships(INITIAL_RELATIONSHIPS);
       setDumps(INITIAL_DUMPS);
